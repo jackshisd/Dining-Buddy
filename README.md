@@ -29,7 +29,7 @@ All interaction is handled with a **single button**, and menu data is stored in 
 | **Push Button**             | 6mm tactile push button                |
 | **Custom PCB**              | Designed in KiCad for compact layout   |
 | **0603 Resistor** (optional)| 220Ω for LED indicator                 |
-| **0603 LED** (optional)     | 220Ω for LED indicator                 |
+| **0603 LED** (optional)     | Miscellaneous LED feedback             |
 
 ## 🕹 User Guide
 
