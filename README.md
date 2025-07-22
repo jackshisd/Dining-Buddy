@@ -13,8 +13,10 @@ All interaction is handled with a **single button**, and menu data is stored in 
 ### Prototype
 ![alt text](prototype.png)
 ### Finished Solder Assembly
-![alt text](pcb1.png)
-![alt text](pcb2.png)
+![alt text](front.png)
+![alt text](back.png)
+![alt text](front.png)
+![alt text](side.png)
 ### Schematic
 ![alt text](schematic.png)
 ### PCB
