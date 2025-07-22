@@ -9,6 +9,12 @@ Menus are downloaded once daily and displayed with smooth auto-scrolling. The de
 
 All interaction is handled with a **single button**, and menu data is stored in **SPIFFS**. The PCB was custom-designed in **KiCad** for a minimal, keychain-friendly form factor.
 
+## Photos
+![alt text](schematic.png)
+![alt text](pcb1.png)
+![alt text](pcb2.png)
+
+
 ## 🧠 Features
 
 - 📅 View current and future dining menus (up to 6 days)
