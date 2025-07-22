@@ -10,14 +10,14 @@ Menus are downloaded once daily and displayed with smooth auto-scrolling. The de
 All interaction is handled with a **single button**, and menu data is stored in **SPIFFS**. The PCB was custom-designed in **KiCad** for a minimal, keychain-friendly form factor.
 
 ## Photos
-###Prototype
+### Prototype
 ![alt text](prototype.png)
-###Finished Solder Assembly
+### Finished Solder Assembly
 ![alt text](pcb1.png)
 ![alt text](pcb2.png)
-###Schematic
+### Schematic
 ![alt text](schematic.png)
-###PCB
+### PCB
 ![alt text](pcb1.png)
 ![alt text](pcb2.png)
 
