@@ -17,7 +17,6 @@ All interaction is handled with a **single button**, and menu data is stored in 
 ### Finished Solder Assembly  
 <img src="front.png" alt="Front" width="300"/>
 <img src="back.png" alt="Back" width="300"/>
-<img src="front.png" alt="Front Again" width="300"/>
 <img src="side.png" alt="Side" width="300"/>
 
 ### Schematic  
