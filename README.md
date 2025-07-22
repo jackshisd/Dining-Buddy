@@ -20,6 +20,17 @@ All interaction is handled with a **single button**, and menu data is stored in 
 - 🔋 OLED shuts off in sleep to preserve battery
 - 🧾 All menus saved as clean, compact `.menu` files
 
+## 🔧 Bill of Materials
+
+| Component                    | Description                            |
+|-----------------------------|----------------------------------------|
+| **ESP32-C3**                | Seeed Studio ESP32-C3 dev board        |
+| **OLED Display**            | 0.91" I2C SSD1306 (128×32)             |
+| **Push Button**             | 6mm tactile push button                |
+| **Custom PCB**              | Designed in KiCad for compact layout   |
+| **0603 Resistor** (optional)| 220Ω for LED indicator                 |
+| **0603 LED** (optional)     | 220Ω for LED indicator                 |
+
 ## 🕹 User Guide
 
 **Navigation is controlled by one button:**
