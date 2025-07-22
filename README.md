@@ -5,7 +5,7 @@
 
 Dining Buddy is an ultra-compact ESP32-C3-based keychain device that displays **UCLA dining hall menus** and **real-time weather**, with full offline functionality, minimal power use, and intuitive controls—all on a tiny OLED screen.
 
-Menus are downloaded once daily and displayed with smooth auto-scrolling. The device also includes a **date selection mode**, **hall switching**, and a **live weather page**. It sleeps after 30 seconds of inactivity and wakes automatically every night at 2:30 AM to rotate cached menu files and download new ones.
+Menus are downloaded once daily and displayed with smooth auto-scrolling. The device also includes a **date selection mode**, **hall switching**, and a **live weather page**. It deep sleeps after 30 seconds of inactivity and wakes automatically every night at 2:30 AM to rotate cached menu files and download new ones.
 
 All interaction is handled with a **single button**, and menu data is stored in **SPIFFS**. The PCB was custom-designed in **KiCad** for a minimal, keychain-friendly form factor.
 
@@ -17,7 +17,7 @@ All interaction is handled with a **single button**, and menu data is stored in 
 - 🕒 Deep sleep with scheduled nightly wake (2:30 AM)
 - 📡 Wi-Fi download over UCLA Wi-Fi or eduroam
 - 🪛 Single-button interaction (short, long, double press)
-- 🔋 OLED shuts off in sleep to preserve battery
+- 🔋 OLED shuts off in deep sleep to preserve battery
 - 🧾 All menus saved as clean, compact `.menu` files
 
 ## 🔧 Bill of Materials
