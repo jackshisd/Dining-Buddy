@@ -1,4 +1,4 @@
-# 🥡 Dining Buddy v6.0  
+# Dining Buddy v6.0  
 **ESP32-C3 OLED Keychain for UCLA Dining Menus + Weather Display**
 
 ## 📦 Overview
