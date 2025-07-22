@@ -1,0 +1,88 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <esp_eap_client.h>
+
+#define EAP_ANONYMOUS_IDENTITY "anon@ucla.edu"
+#define EAP_IDENTITY "your_email"
+#define EAP_PASSWORD "your_password"
+
+const char* ssid = "eduroam";
+
+void connectToEduroam() {
+  Serial.print("Connecting to eduroam...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, WPA2_AUTH_PEAP, EAP_ANONYMOUS_IDENTITY, EAP_IDENTITY, EAP_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+String stripHtmlTags(const String& line, const String& tag) {
+  int start = line.indexOf("<" + tag + ">");
+  int end = line.indexOf("</" + tag + ">");
+  if (start != -1 && end != -1) {
+    return line.substring(start + tag.length() + 2, end);
+  }
+  return "";
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  connectToEduroam();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (!client.connect("dining.ucla.edu", 443)) {
+    Serial.println("❌ HTTPS connection failed");
+    return;
+  }
+
+  client.print(String("GET ") + "/bruin-plate/ HTTP/1.1\r\n" +
+               "Host: dining.ucla.edu\r\n" +
+               "User-Agent: ESP32\r\n" +
+               "Connection: close\r\n\r\n");
+
+  bool inBody = false;
+  String currentCategory = "";
+
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+
+    if (!inBody && line.length() == 0) {
+      inBody = true;
+      continue;
+    }
+
+    if (inBody) {
+      if (line.indexOf("<h2>") != -1) {
+        currentCategory = stripHtmlTags(line, "h2");
+        if (currentCategory.length() > 0) {
+          Serial.println();
+          Serial.println("=== " + currentCategory + " ===");
+        }
+      }
+
+      if (line.indexOf("<h3>") != -1) {
+        String item = stripHtmlTags(line, "h3");
+        if (item.length() > 0 && currentCategory.length() > 0) {
+          Serial.println("- " + item);
+        }
+      }
+    }
+  }
+
+  client.stop();
+  Serial.println("\n✅ Done parsing.");
+}
+
+void loop() {
+  // Nothing needed here
+}

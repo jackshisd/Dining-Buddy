@@ -1,0 +1,105 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const int BUTTON_PIN = 4;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONGPRESS_MS = 500;
+const unsigned long DOUBLECLICK_MS = 400;
+
+bool lastButtonState = HIGH;
+bool buttonState = HIGH;
+unsigned long lastDebounceTime = 0;
+
+unsigned long pressStartTime = 0;
+unsigned long lastReleaseTime = 0;
+int clickCount = 0;
+bool waitingForSecondClick = false;
+
+String currentMessage = "";
+
+void showMessage(const String& message) {
+  if (message != currentMessage) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println(message);
+    display.display();
+    currentMessage = message;
+  }
+}
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
+
+  showMessage("Ready...");
+}
+
+void loop() {
+  bool reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = now;
+  }
+
+  if ((now - lastDebounceTime) > DEBOUNCE_MS) {
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      if (buttonState == LOW) {
+        // Button just pressed
+        pressStartTime = now;
+        showMessage("Button pressed...");
+      } else {
+        // Button just released
+        unsigned long pressDuration = now - pressStartTime;
+
+        if (pressDuration >= LONGPRESS_MS) {
+          showMessage("Long press detected.");
+          waitingForSecondClick = false;
+          clickCount = 0;
+        } else {
+          // Short press - count clicks
+          clickCount++;
+          lastReleaseTime = now;
+          waitingForSecondClick = true;
+        }
+      }
+    }
+  }
+
+  // Check for long press while still held
+  if (buttonState == LOW && (now - pressStartTime) >= LONGPRESS_MS && clickCount == 0) {
+    showMessage("Long press detected.");
+    waitingForSecondClick = false;
+    clickCount = 0;
+  }
+
+  // Check for single/double click after timeout
+  if (waitingForSecondClick && (now - lastReleaseTime) > DOUBLECLICK_MS) {
+    if (clickCount == 1) {
+      showMessage("Single click detected.");
+    } else if (clickCount == 2) {
+      showMessage("Double click detected.");
+    }
+    waitingForSecondClick = false;
+    clickCount = 0;
+  }
+
+  if (buttonState == HIGH && clickCount == 0 && !waitingForSecondClick && currentMessage != "Ready...") {
+    showMessage("Ready...");
+  }
+
+  lastButtonState = reading;
+}

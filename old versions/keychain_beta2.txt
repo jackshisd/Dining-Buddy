@@ -1,0 +1,493 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <SPIFFS.h>
+#include <esp_eap_client.h>
+
+/* ---------- Wi-Fi ---------- */
+#define EAP_ANON "anon@ucla.edu"
+#define EAP_IDENTITY "your_email"
+#define EAP_PASSWORD "your_password"
+const char *WIFI_SSID = "SSID";
+const char *WIFI_PSK  = "password";
+
+
+/* ---------- OLED ---------- */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+/* ---------- BUTTON ---------- */
+const int BUTTON_PIN = 4;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONGPRESS_MS = 600;
+
+bool lastButtonState = HIGH;
+bool buttonState = HIGH;
+unsigned long lastDebounceTime = 0;
+
+unsigned long pressStartTime = 0;
+bool longPressDetected = false;
+
+/* ---------- Dining Halls ---------- */
+struct Hall {
+  const char *name;
+  const char *host;
+  const char *path;
+  const char *file;
+} halls[] = {
+  { "Bruin Plate", "dining.ucla.edu", "/bruin-plate/",       "/bplate.menu" },
+  { "Epicuria",    "dining.ucla.edu", "/epicuria-at-covel/", "/covel.menu"  },
+  { "De Neve",     "dining.ucla.edu", "/de-neve-dining/",    "/deneve.menu" }
+};
+
+const int NUM_HALLS = sizeof(halls) / sizeof(halls[0]);
+int currentHallIndex = 0;
+
+/* ---------- Menu Pages ---------- */
+struct MenuPage {
+  String mealLetter;       // B, L, or D
+  String title;            // category title
+  String scrollingText;    // dishes combined
+};
+
+std::vector<MenuPage> pages;
+int currentPageIndex = 0;
+
+int scrollOffset = 0;
+unsigned long lastScroll = 0;
+const int SCROLL_SPEED_MS = 50;
+
+/* ---------- Prototypes ---------- */
+void connectLocalWiFi(const char*, const char*);
+void connectEduroam();
+bool downloadPage(const char*, const char*);
+void extractMenu(const char*);
+void loadMenuPagesForCurrentHall();
+void showCurrentPage();
+void scrollText();
+void handleButton();
+void shortPressAction();
+void longPressAction();
+String cleanText(String);
+void showProgress(const String&);
+
+/* ============================================================ */
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Starting...");
+  display.display();
+
+  if (!SPIFFS.begin(true)) {
+    showProgress("SPIFFS mount failed!");
+    while (1);
+  }
+
+  // Connect to Wi-Fi
+  connectEduroam();
+
+  // Scrape every hall
+  for (Hall &h : halls) {
+    String msg = "Downloading " + String(h.name) + "...";
+    showProgress(msg);
+
+    if (downloadPage(h.host, h.path)) {
+      showProgress("Parsing...");
+      extractMenu(h.file);
+    } else {
+      showProgress("DL failed: " + String(h.name));
+    }
+  }
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  loadMenuPagesForCurrentHall();
+  showCurrentPage();
+}
+
+void loop() {
+  handleButton();
+  scrollText();
+}
+
+/* ----------------------------------------------------------- */
+/* SHOW PROGRESS ON OLED + SERIAL                              */
+/* ----------------------------------------------------------- */
+void showProgress(const String& msg) {
+  Serial.println(msg);
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println(cleanText(msg));
+  display.display();
+}
+
+/* ----------------------------------------------------------- */
+/* BUTTON HANDLING                                             */
+/* ----------------------------------------------------------- */
+void handleButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = now;
+  }
+
+  if ((now - lastDebounceTime) > DEBOUNCE_MS) {
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      if (buttonState == LOW) {
+        pressStartTime = now;
+        longPressDetected = false;
+      } else {
+        unsigned long pressDuration = now - pressStartTime;
+
+        if (!longPressDetected && pressDuration < LONGPRESS_MS) {
+          shortPressAction();
+        }
+        // no longPressAction() here!
+      }
+    }
+  }
+
+  if (!longPressDetected && buttonState == LOW && (now - pressStartTime) >= LONGPRESS_MS) {
+    longPressAction();
+    longPressDetected = true;
+  }
+
+  lastButtonState = reading;
+}
+
+void shortPressAction() {
+  currentPageIndex++;
+  if (currentPageIndex >= pages.size()) {
+    currentPageIndex = 0;
+  }
+  scrollOffset = 0;
+  showCurrentPage();
+}
+
+void longPressAction() {
+  currentHallIndex++;
+  if (currentHallIndex >= NUM_HALLS) {
+    currentHallIndex = 0;
+  }
+  loadMenuPagesForCurrentHall();
+  scrollOffset = 0;
+  showCurrentPage();
+}
+
+/* ----------------------------------------------------------- */
+/* SHOW CURRENT PAGE                                           */
+/* ----------------------------------------------------------- */
+void showCurrentPage() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  String hallName = String(halls[currentHallIndex].name);
+  hallName.replace("Bruin Plate", "Bplate");
+  hallName.replace("Epicuria", "Epic");
+
+  MenuPage &page = pages[currentPageIndex];
+  String mealLetter = page.mealLetter;
+  String header = hallName;
+  if (mealLetter.length() > 0) {
+    header += " " + mealLetter;
+  }
+  header += " " + page.title;
+
+  display.println(cleanText(header));
+  display.display();
+}
+
+/* ----------------------------------------------------------- */
+/* SCROLL TEXT                                                 */
+/* ----------------------------------------------------------- */
+void scrollText() {
+  unsigned long now = millis();
+  if (now - lastScroll < SCROLL_SPEED_MS) return;
+  lastScroll = now;
+
+  display.fillRect(0, 8, SCREEN_WIDTH, 24, BLACK);
+
+  MenuPage &page = pages[currentPageIndex];
+  String text = cleanText(page.scrollingText);
+
+  display.setCursor(-scrollOffset, 8);
+  display.print(text);
+  display.display();
+
+  scrollOffset += 1;
+  if (scrollOffset > (text.length() * 6)) {
+    scrollOffset = 0;
+  }
+}
+
+/* ----------------------------------------------------------- */
+/* LOAD MENU PAGES                                             */
+/* ----------------------------------------------------------- */
+void loadMenuPagesForCurrentHall() {
+  pages.clear();
+
+  File f = SPIFFS.open(halls[currentHallIndex].file, FILE_READ);
+  if (!f) {
+    pages.push_back({"", "Error", "Menu file missing."});
+    return;
+  }
+
+  String currentMealLetter = "";
+  String currentTitle = "";
+  String currentDishes = "";
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("===")) {
+      String heading = line;
+      heading.replace("=", "");
+      heading.trim();
+
+      if (heading.equalsIgnoreCase("BREAKFAST")) {
+        currentMealLetter = "B";
+      } else if (heading.equalsIgnoreCase("LUNCH")) {
+        currentMealLetter = "L";
+      } else if (heading.equalsIgnoreCase("DINNER")) {
+        currentMealLetter = "D";
+      } else {
+        if (!currentTitle.isEmpty() && !currentDishes.isEmpty()) {
+          pages.push_back({currentMealLetter, currentTitle, currentDishes});
+        }
+        currentTitle = heading;
+        currentDishes = "";
+      }
+    } else if (line.startsWith("-")) {
+      String dish = line.substring(1);
+      dish.trim();
+      currentDishes += dish + " • ";
+    }
+  }
+
+  if (!currentTitle.isEmpty() && !currentDishes.isEmpty()) {
+    pages.push_back({currentMealLetter, currentTitle, currentDishes});
+  }
+
+  f.close();
+
+  if (pages.empty()) {
+    pages.push_back({"", "Empty", "No data."});
+  }
+
+  currentPageIndex = 0;
+}
+
+/* ----------------------------------------------------------- */
+/* CONNECT TO LOCAL WIFI                                       */
+/* ----------------------------------------------------------- */
+void connectLocalWiFi(const char *ssid, const char *pwd) {
+  showProgress("Connecting Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pwd);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(350);
+  }
+  showProgress("IP: " + WiFi.localIP().toString());
+}
+
+/* ----------------------------------------------------------- */
+/* CONNECT TO EDUROAM                                          */
+/* ----------------------------------------------------------- */
+void connectEduroam() {
+  showProgress("Connecting eduroam...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("eduroam", WPA2_AUTH_PEAP,
+             EAP_ANON, EAP_ID, EAP_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(350);
+  }
+  showProgress("IP: " + WiFi.localIP().toString());
+}
+
+/* ----------------------------------------------------------- */
+/* DOWNLOAD HTML                                               */
+/* ----------------------------------------------------------- */
+bool downloadPage(const char *host, const char *path) {
+  WiFiClientSecure cli;
+  cli.setInsecure();
+
+  showProgress("GET https://" + String(host) + String(path));
+  if (!cli.connect(host, 443, 10000)) {
+    showProgress("TLS connect failed");
+    return false;
+  }
+  cli.printf(
+    "GET %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "User-Agent: ESP32-MenuScraper\r\n"
+    "Accept: text/html\r\n"
+    "Connection: close\r\n\r\n", path, host);
+
+  String status = cli.readStringUntil('\n');
+  int code = status.substring(9, 12).toInt();
+  String loc;
+  while (cli.connected()) {
+    String h = cli.readStringUntil('\n');
+    h.trim();
+    if (h.length() == 0) break;
+    if (h.startsWith("Location:")) loc = h.substring(9);
+  }
+  if ((code == 301 || code == 302) && loc.length()) {
+    cli.stop();
+    loc.trim();
+    if (loc.startsWith("http")) {
+      int s = loc.indexOf('/', loc.indexOf("://") + 3);
+      String nHost = loc.substring(loc.indexOf("://") + 3, s);
+      String nPath = loc.substring(s);
+      return downloadPage(nHost.c_str(), nPath.c_str());
+    }
+    return downloadPage(host, loc.c_str());
+  }
+
+  File out = SPIFFS.open("/dump.html", FILE_WRITE);
+  if (!out) {
+    showProgress("Can't create dump.html");
+    cli.stop();
+    return false;
+  }
+
+  while (cli.connected() || cli.available()) {
+    while (cli.available()) {
+      out.write(cli.read());
+    }
+  }
+  out.close();
+  cli.stop();
+  showProgress("✅ Downloaded.");
+  return true;
+}
+
+/* ----------------------------------------------------------- */
+/* PARSE HTML ➜ .menu FILE                                     */
+/* ----------------------------------------------------------- */
+void extractMenu(const char *dstFile) {
+  File in = SPIFFS.open("/dump.html", FILE_READ);
+  if (!in) {
+    showProgress("/dump.html missing!");
+    return;
+  }
+
+  File out = SPIFFS.open(dstFile, FILE_WRITE);
+  if (!out) {
+    showProgress("Can't create compact file.");
+    in.close();
+    return;
+  }
+
+  const char *SKIP_PHRASES[] = {
+    "icon legend",
+    "location &",
+    "farm to table",
+    "fresh, local, sustainable meals",
+    "today’s dining hours",
+    "today's dining hours",
+    "address"
+  };
+  constexpr size_t N_SKIP = sizeof(SKIP_PHRASES) / sizeof(SKIP_PHRASES[0]);
+
+  String content = "";
+  String last = "";
+  char level = 0;
+  bool inTag = false;
+  bool captureText = false;
+  bool anything = false;
+  String tag = "";
+
+  auto unwanted = [&](const String &txt) {
+    String low = txt; low.toLowerCase();
+    for (size_t i = 0; i < N_SKIP; ++i)
+      if (low.startsWith(SKIP_PHRASES[i])) return true;
+    return false;
+  };
+
+  while (in.available()) {
+    char c = in.read();
+    if (!inTag && c == '<') {
+      tag = "<";
+      inTag = true;
+      continue;
+    }
+    if (inTag) {
+      tag += c;
+      if (c == '>') {
+        inTag = false;
+        if (tag.startsWith("<h2") || tag.startsWith("<h3")) {
+          level = tag.charAt(2);
+          content = "";
+          captureText = true;
+        } else if (captureText &&
+                  ((level == '2' && tag.startsWith("</h2")) ||
+                   (level == '3' && tag.startsWith("</h3")))) {
+          String trimmed = content; trimmed.trim();
+          if (trimmed.length() && !unwanted(trimmed)) {
+            if (!trimmed.equalsIgnoreCase(last)) {
+              if (level == '2') {
+                out.printf("\n=== %s ===\n", trimmed.c_str());
+              } else {
+                out.printf("- %s\n", trimmed.c_str());
+              }
+              last = trimmed;
+              anything = true;
+            }
+          }
+          captureText = false;
+        }
+        tag = "";
+      }
+      continue;
+    }
+    if (captureText) {
+      if (c == '\n' || c == '\r') c = ' ';
+      content += c;
+    }
+  }
+  in.close(); out.close();
+
+  if (anything) {
+    showProgress("✅ Menu saved: " + String(dstFile));
+  } else {
+    showProgress("⚠️ No headings found!");
+  }
+}
+
+/* ----------------------------------------------------------- */
+/* CLEAN TEXT TO ASCII ONLY                                    */
+/* ----------------------------------------------------------- */
+String cleanText(String s) {
+  String out = "";
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c >= 32 && c <= 126) {
+      out += c;
+    }
+  }
+  return out;
+}

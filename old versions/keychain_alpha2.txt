@@ -1,0 +1,77 @@
+/**
+ *  ESP32 SPIFFS HTML Dump Viewer
+ *  -----------------------------
+ *  • Connects to Wi-Fi
+ *  • Dumps contents of /dump.html to Serial
+ */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <SPIFFS.h>
+
+/* ---------- credentials ---------- */
+const char* SSID = "SSID";
+const char* PASS = "password";
+
+/* ============================================================= */
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+
+  connectLocalWiFi();
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ SPIFFS mount failed!");
+    return;
+  }
+
+  dumpHtmlFile();
+}
+
+void loop()
+{
+  // Do nothing
+}
+
+/* ============================================================= */
+
+void connectLocalWiFi()
+{
+  Serial.print("Connecting to Wi-Fi…");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SSID, PASS);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\n✅ Connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void dumpHtmlFile()
+{
+  File file = SPIFFS.open("/dump.html");
+  if (!file) {
+    Serial.println("❌ Failed to open /dump.html!");
+    return;
+  }
+
+  Serial.println("\n===== START OF /dump.html =====\n");
+
+  // Print contents in chunks for large files
+  size_t chunkSize = 1024;
+  uint8_t buffer[chunkSize];
+  while (file.available()) {
+    size_t len = file.read(buffer, chunkSize);
+    Serial.write(buffer, len);
+  }
+
+  Serial.println("\n\n===== END OF /dump.html =====\n");
+
+  file.close();
+}

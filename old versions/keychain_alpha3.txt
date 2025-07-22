@@ -1,0 +1,161 @@
+/**
+ *  UCLA Dining – Heading extractor (streaming)
+ *  ------------------------------------------
+ *  • Downloads https://dining.ucla.edu/bruin-plate/  ➜ /dump.html  (SPIFFS)
+ *  • Re-opens the file and streams through it
+ *    – accepts tags like <h2 class="x">  or  <h3 id="y" >
+ *  • Prints every <h2>/<h3> text it meets
+ *
+ *  Tested on ESP32-C3, ESP32-S3   — Arduino-ESP32 3.2.0
+ */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <SPIFFS.h>
+
+/* ----------------  your Wi-Fi ---------------- */
+const char *WIFI_SSID = "SSID";
+const char *WIFI_PSK  = "password";
+
+/* ---------------- prototypes ----------------- */
+bool downloadPage(const char *host, const char *path);
+void extractHeadings();
+
+/* ===================================================== */
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ SPIFFS mount failed");  while (1);
+  }
+
+  size_t total = SPIFFS.totalBytes();     // total bytes in the partition
+size_t used  = SPIFFS.usedBytes();      // bytes already taken
+size_t free  = total - used;            // what’s left
+
+Serial.printf("🗄  SPIFFS total %u kB, free %u kB\n",
+              total / 1024, free / 1024);
+
+
+  /* ---------- Wi-Fi ---------- */
+  Serial.print("Connecting Wi-Fi");
+  WiFi.begin(WIFI_SSID, WIFI_PSK);
+  while (WiFi.status() != WL_CONNECTED) { Serial.print('.'); delay(400); }
+  Serial.printf("\n✅ Wi-Fi!  IP %s\n", WiFi.localIP().toString().c_str());
+
+  /* ---------- download ---------- */
+  if (!downloadPage("dining.ucla.edu", "/bruin-plate/")) {
+    Serial.println("❌ download failed"); return;
+  }
+  Serial.println("✅ HTML saved to /dump.html");
+
+  /* ---------- parse ---------- */
+  extractHeadings();
+}
+
+void loop() {}
+
+/* ===================================================== */
+/*        HTTPS GET  (unchanged except progress msgs)    */
+/* ===================================================== */
+bool downloadPage(const char *host, const char *path)
+{
+  WiFiClientSecure cli;  cli.setInsecure();
+  Serial.printf("🌐 GET https://%s%s\n", host, path);
+
+  if (!cli.connect(host, 443, 10000)) {
+    Serial.println("❌ TLS connect failed"); return false;
+  }
+
+  cli.printf("GET %s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "User-Agent: ESP32\r\n"
+             "Accept: text/html\r\n"
+             "Connection: close\r\n\r\n", path, host);
+
+  /* skip headers */
+  String line = cli.readStringUntil('\n');      // status
+  while (cli.connected() && line.length() > 1)  // blank line = END headers
+        line = cli.readStringUntil('\n');
+
+  File f = SPIFFS.open("/dump.html", FILE_WRITE);
+  if (!f) { Serial.println("❌ can't open /dump.html"); return false; }
+
+  size_t total = 0, lastMark = millis();
+  uint8_t buf[1024];
+  while (cli.available() || cli.connected()) {
+    size_t n = cli.read(buf, sizeof(buf));
+    if (n) {
+      f.write(buf, n);
+      total += n;
+      if (millis() - lastMark > 2000) {
+        Serial.printf("📄 %u bytes...\n", total);
+        lastMark = millis();
+      }
+    }
+  }
+  f.close();  cli.stop();
+  Serial.printf("📦 total %u bytes\n", total);
+  return total > 0;
+}
+
+/* ===================================================== */
+/*        Stream-parse /dump.html for <h2>/<h3>          */
+/* ===================================================== */
+void extractHeadings()
+{
+  Serial.println("\n🔍 Parsing headings…");
+
+  File f = SPIFFS.open("/dump.html", FILE_READ);
+  if (!f) { Serial.println("❌ open /dump.html failed"); return; }
+
+  const size_t BUFSZ = 512;           // small buffer
+  static char   buf[BUFSZ+8];         // +8 so sentinel search is safe
+  size_t fill = 0;                    // how many bytes currently in buf
+
+  auto toLower = [](char c){ return (c >= 'A' && c <= 'Z') ? c+32 : c; };
+
+  while (f.available()) {
+    /* -------------------------------------------------- */
+    /* shift leftover tail to front, then fill from file  */
+    if (fill) memmove(buf, buf + (BUFSZ - 128), 128), fill = 128;
+    size_t n = f.read((uint8_t*)buf + fill, BUFSZ - fill);
+    fill += n;  buf[fill] = '\0';
+
+    /* -------------------------------------------------- */
+    /* lowercase in-place (ASCII only, fine for tags)     */
+    for (size_t i = 0; i < fill; ++i) buf[i] = toLower(buf[i]);
+
+    /* -------------------------------------------------- */
+    /* scan buffer for <h2 or <h3                         */
+    char *p = buf;
+    while ((p = strchr(p, '<'))) {
+      if (p[1] != 'h' || (p[2] != '2' && p[2] != '3')) { ++p; continue; }
+      char level = p[2];                         // '2' or '3'
+      char *gt   = strchr(p, '>');               // end of opening tag
+      if (!gt) break;                            // incomplete in buffer
+      char *close = strstr(gt+1, level=='2' ? "</h2>" : "</h3>");
+      if (!close) break;                         // incomplete in buffer
+
+      String text;
+      for (char *c = gt+1; c < close; ++c) {     // copy text, skip tags
+        if (*c == '<') {                         // skip nested HTML
+          c = strchr(c, '>');
+          if (!c) break;
+          continue;
+        }
+        text += *c;
+      }
+      text.trim();
+      if (text.length()) {
+        if (level == '2') Serial.println("\n=== " + text + " ===");
+        else              Serial.println("- " + text);
+      }
+      p = close + 5;                             // jump past </h2|h3>
+    }
+  }
+  f.close();
+  Serial.println("\n✅ Done parsing headings.");
+}

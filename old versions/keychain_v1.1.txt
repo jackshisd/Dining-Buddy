@@ -1,0 +1,718 @@
+#include Wire.h
+#include Adafruit_GFX.h
+#include Adafruit_SSD1306.h
+#include WiFi.h
+#include WiFiClientSecure.h
+#include SPIFFS.h
+#include time.h
+#include esp_sleep.h
+#include esp_eap_client.h
+
+
+
+ ---------- Wi-Fi ---------- 
+#define EAP_ANON "anon@ucla.edu"
+#define EAP_IDENTITY "your_email"
+#define EAP_PASSWORD "your_password"
+const char *WIFI_SSID = "SSID";
+const char *WIFI_PSK  = "password";
+
+ ---------- OLED ---------- 
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+ ---------- BUTTON ---------- 
+const int BUTTON_PIN = 4;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONGPRESS_MS = 600;
+const unsigned long DOUBLECLICK_MS = 400;
+
+ ---------- State Vars ---------- 
+bool lastButtonState = HIGH;
+bool buttonState = HIGH;
+unsigned long lastDebounceTime = 0;
+
+unsigned long pressStartTime = 0;
+bool longPressDetected = false;
+
+unsigned long lastInteractionTime = 0;
+bool onWeatherPage = false;
+bool wasDeepSleep = false;
+
+int clickCount = 0;
+unsigned long lastClickTime = 0;
+
+ ---------- RTC Vars ---------- 
+RTC_DATA_ATTR time_t lastMenuFetch = 0;
+
+ ---------- Dining Halls ---------- 
+struct Hall {
+  const char name;
+  const char host;
+  const char path;
+  const char file;
+} halls[] = {
+  { Bruin Plate, dining.ucla.edu, bruin-plate,       bplate.menu },
+  { Epicuria,    dining.ucla.edu, epicuria-at-covel, covel.menu  },
+  { De Neve,     dining.ucla.edu, de-neve-dining,    deneve.menu }
+};
+
+const int NUM_HALLS = sizeof(halls)  sizeof(halls[0]);
+int currentHallIndex = 0;
+
+ ---------- Menu Pages ---------- 
+struct MenuPage {
+  String mealLetter;
+  String title;
+  String scrollingText;
+};
+
+stdvectorMenuPage pages;
+int currentPageIndex = 0;
+
+int scrollOffset = 0;
+unsigned long lastScroll = 0;
+const int SCROLL_SPEED_MS = 50;
+
+ ---------- WeatherDate ---------- 
+String currentWeather = ;
+String currentDate = ;
+String currentTimeStr = ;
+unsigned long lastWeatherRefresh = 0;
+const unsigned long WEATHER_REFRESH_MS = 10  60  1000UL;  refresh every 10 mins
+
+ ---------- Prototypes ---------- 
+void connectLocalWiFi(const char, const char);
+bool downloadPage(const char, const char);
+void extractMenu(const char);
+void loadMenuPagesForCurrentHall();
+void showCurrentPage();
+void scrollText();
+void handleButton();
+void handleClick();
+void shortPressAction();
+void longPressAction();
+void doublePressAction();
+void showWeatherPage();
+void fetchWeather();
+void fetchDateTime();
+void enterDeepSleep();
+String cleanText(String);
+void showProgress(const String&);
+String getCurrentMealLetter();
+void setPageForCurrentMeal();
+bool shouldFetchMenusToday();
+void fetchMenus();
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(SSD1306 failed);
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println(Booting...);
+  display.display();
+
+  if (!SPIFFS.begin(true)) {
+    showProgress(SPIFFS failed!);
+    while (1);
+  }
+
+  configTzTime(PST8PDT,M3.2.0,M11.1.0, pool.ntp.org, time.nist.gov);
+  delay(800);
+
+   Check why we woke up
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    wasDeepSleep = true;
+    delay(50);   discard any bouncing LOW signal
+    while (digitalRead(BUTTON_PIN) == LOW) {
+      delay(10);
+    }
+  }
+
+  if (shouldFetchMenusToday()) {
+    connectLocalWiFi(LOCAL_SSID, LOCAL_PASS); connectLocalWiFi(LOCAL_SSID, LOCAL_PASS);
+    fetchMenus();
+    lastMenuFetch = time(NULL);
+    WiFi.disconnect(true);
+  } else {
+    showProgress(Skip Wi-Fi. Stored data OK.);
+  }
+
+  loadMenuPagesForCurrentHall();
+  setPageForCurrentMeal();
+  showCurrentPage();
+  lastInteractionTime = millis();
+}
+
+void loop() {
+  handleButton();
+
+  if (onWeatherPage) {
+    if (millis() - lastWeatherRefresh  WEATHER_REFRESH_MS) {
+      connectLocalWiFi(LOCAL_SSID, LOCAL_PASS); connectLocalWiFi(LOCAL_SSID, LOCAL_PASS);
+      fetchDateTime();
+      fetchWeather();
+      lastWeatherRefresh = millis();
+    }
+    showWeatherPage();
+  } else {
+    scrollText();
+  }
+
+  if (!onWeatherPage && millis() - lastInteractionTime  15000) {
+    enterDeepSleep();
+  }
+}
+
+bool shouldFetchMenusToday() {
+  fetchDateTime();
+
+  struct tm nowTime;
+  if (!getLocalTime(&nowTime)) return true;
+
+  time_t nowEpoch = time(NULL);
+
+  if (lastMenuFetch == 0) return true;
+
+  struct tm last = localtime(&lastMenuFetch);
+
+  if (nowTime.tm_yday != last-tm_yday && nowTime.tm_hour = 0) {
+    return true;
+  }
+
+  return false;
+}
+
+void fetchMenus() {
+  for (Hall &h  halls) {
+    showProgress(Downloading  + String(h.name) + ...);
+    if (downloadPage(h.host, h.path)) {
+      showProgress(Parsing...);
+      extractMenu(h.file);
+    } else {
+      showProgress(DL failed  + String(h.name));
+    }
+  }
+  showProgress(Menus updated.);
+}
+
+void enterDeepSleep() {
+  showProgress(Sleeping...);
+  delay(500);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
+  display.clearDisplay();
+  display.display();
+  esp_deep_sleep_start();
+}
+
+void handleButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = now;
+  }
+
+  if ((now - lastDebounceTime)  DEBOUNCE_MS) {
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      if (buttonState == LOW) {
+        pressStartTime = now;
+        longPressDetected = false;
+      } else {
+        unsigned long pressDuration = now - pressStartTime;
+
+        if (!longPressDetected && pressDuration  LONGPRESS_MS) {
+          handleClick();
+        }
+      }
+    }
+  }
+
+  if (!longPressDetected && buttonState == LOW && (now - pressStartTime) = LONGPRESS_MS) {
+    longPressAction();
+    longPressDetected = true;
+  }
+
+  lastButtonState = reading;
+
+  if (clickCount == 1 && millis() - lastClickTime  DOUBLECLICK_MS) {
+    shortPressAction();
+    clickCount = 0;
+  }
+}
+
+void handleClick() {
+  unsigned long now = millis();
+
+  if (now - lastClickTime  DOUBLECLICK_MS) {
+    clickCount++;
+    if (clickCount == 2) {
+      doublePressAction();
+      clickCount = 0;
+    }
+  } else {
+    clickCount = 1;
+  }
+
+  lastClickTime = now;
+  lastInteractionTime = millis();
+}
+
+void shortPressAction() {
+  currentPageIndex++;
+  if (currentPageIndex = pages.size()) {
+    currentPageIndex = 0;
+  }
+  scrollOffset = 0;
+  showCurrentPage();
+  lastInteractionTime = millis();
+}
+
+void longPressAction() {
+  currentHallIndex++;
+  if (currentHallIndex = NUM_HALLS) {
+    currentHallIndex = 0;
+  }
+  loadMenuPagesForCurrentHall();
+  setPageForCurrentMeal();
+  scrollOffset = 0;
+  showCurrentPage();
+  lastInteractionTime = millis();
+}
+
+void doublePressAction() {
+  if (onWeatherPage) {
+    onWeatherPage = false;
+    showCurrentPage();
+  } else {
+    onWeatherPage = true;
+    connectLocalWiFi(LOCAL_SSID, LOCAL_PASS); connectLocalWiFi(LOCAL_SSID, LOCAL_PASS);
+    fetchDateTime();
+    fetchWeather();
+    lastWeatherRefresh = millis();
+    showWeatherPage();
+  }
+}
+
+void showCurrentPage() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  String hallName = String(halls[currentHallIndex].name);
+  hallName.replace(Bruin Plate, Bplate);
+  hallName.replace(Epicuria, Epic);
+
+  MenuPage &page = pages[currentPageIndex];
+  String header = hallName;
+  if (page.mealLetter.length()  0) {
+    header +=   + page.mealLetter;
+  }
+  header +=   + page.title;
+
+  display.println(cleanText(header));
+  display.display();
+}
+
+void scrollText() {
+  unsigned long now = millis();
+  if (now - lastScroll  SCROLL_SPEED_MS) return;
+  lastScroll = now;
+
+  MenuPage &page = pages[currentPageIndex];
+  String baseText = cleanText(page.scrollingText);
+  String rope = baseText +    ;
+  int textLen = rope.length();
+
+  int totalChars = 3  21;
+  String view = ;
+
+  for (int i = 0; i  totalChars; i++) {
+    int idx = (scrollOffset + i) % textLen;
+    view += rope[idx];
+    if ((i+1) % 21 == 0 && i  totalChars - 1) {
+      view += n;
+    }
+  }
+
+  display.fillRect(0, 8, SCREEN_WIDTH, 24, BLACK);
+  display.setCursor(0, 8);
+  display.print(view);
+  display.display();
+
+  static unsigned long lastMove = 0;
+  if (millis() - lastMove  300) return;
+  lastMove = millis();
+
+  scrollOffset += 1;
+  if (scrollOffset = textLen) scrollOffset = 0;
+}
+
+void showWeatherPage() {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.println(Date  + currentDate);
+  display.println(Time  + currentTimeStr);
+  display.println(currentWeather);
+  display.display();
+}
+
+void fetchDateTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    currentDate = No RTC;
+    currentTimeStr = ----;
+    return;
+  }
+  char dateStr[20];
+  char timeStr[10];
+  strftime(dateStr, sizeof(dateStr), %Y-%m-%d, &timeinfo);
+  strftime(timeStr, sizeof(timeStr), %H%M, &timeinfo);
+  currentDate = String(dateStr);
+  currentTimeStr = String(timeStr);
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    currentWeather = Wi-Fi lost;
+    return;
+  }
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (!client.connect(wttr.in, 443)) {
+    currentWeather = Weather fail;
+    return;
+  }
+
+  client.print(
+    GET format=3 HTTP1.1rn
+    Host wttr.inrn
+    User-Agent ESP32rn
+    Connection closernrn
+  );
+
+  bool headersEnded = false;
+  while (client.connected()) {
+    String line = client.readStringUntil('n');
+    line.trim();
+    if (line.length() == 0) {
+      headersEnded = true;
+      break;
+    }
+  }
+
+  if (!headersEnded) {
+    currentWeather = No weather;
+    return;
+  }
+
+  if (client.available()) {
+    String weatherLine = client.readStringUntil('n');
+    weatherLine.trim();
+    weatherLine.replace( , );
+    while (weatherLine.indexOf(  ) != -1) {
+      weatherLine.replace(  ,  );
+    }
+    currentWeather = cleanText(weatherLine);
+    return;
+  }
+
+  currentWeather = No weather;
+}
+
+void connectLocalWiFi(const char ssid, const char pwd) {
+  showProgress(Connecting Wi-Fi...);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pwd);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(350);
+  }
+  showProgress(IP  + WiFi.localIP().toString());
+}
+
+#include esp_eap_client.h
+
+void connectEduroam() {
+  showProgress(Connecting eduroam...);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(eduroam, WPA2_AUTH_PEAP,
+             EAP_ANON, EAP_ID, EAP_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(350);
+  }
+  showProgress(IP  + WiFi.localIP().toString());
+}
+
+
+
+bool downloadPage(const char host, const char path) {
+  WiFiClientSecure cli;
+  cli.setInsecure();
+
+  showProgress(GET https + String(host) + String(path));
+  if (!cli.connect(host, 443, 10000)) {
+    showProgress(TLS failed);
+    return false;
+  }
+
+  cli.printf(
+    GET %s HTTP1.1rn
+    Host %srn
+    User-Agent ESP32-MenuScraperrn
+    Connection closernrn, path, host);
+
+  String status = cli.readStringUntil('n');
+  int code = status.substring(9, 12).toInt();
+  String loc;
+  while (cli.connected()) {
+    String h = cli.readStringUntil('n');
+    h.trim();
+    if (h.length() == 0) break;
+    if (h.startsWith(Location)) loc = h.substring(9);
+  }
+  if ((code == 301  code == 302) && loc.length()) {
+    cli.stop();
+    loc.trim();
+    if (loc.startsWith(http)) {
+      int s = loc.indexOf('', loc.indexOf() + 3);
+      String nHost = loc.substring(loc.indexOf() + 3, s);
+      String nPath = loc.substring(s);
+      return downloadPage(nHost.c_str(), nPath.c_str());
+    }
+    return downloadPage(host, loc.c_str());
+  }
+
+  File out = SPIFFS.open(dump.html, FILE_WRITE);
+  if (!out) {
+    showProgress(Can't create dump.html);
+    cli.stop();
+    return false;
+  }
+
+  while (cli.connected()  cli.available()) {
+    while (cli.available()) {
+      out.write(cli.read());
+    }
+  }
+  out.close();
+  cli.stop();
+  showProgress(✅ Downloaded.);
+  return true;
+}
+
+void extractMenu(const char dstFile) {
+  File in = SPIFFS.open(dump.html, FILE_READ);
+  if (!in) {
+    showProgress(dump.html missing!);
+    return;
+  }
+
+  File out = SPIFFS.open(dstFile, FILE_WRITE);
+  if (!out) {
+    showProgress(Can't create compact file.);
+    in.close();
+    return;
+  }
+
+  const char SKIP_PHRASES[] = {
+    icon legend, location &,
+    farm to table, fresh, local, sustainable meals,
+    today’s dining hours, today's dining hours, address
+  };
+  constexpr size_t N_SKIP = sizeof(SKIP_PHRASES)  sizeof(SKIP_PHRASES[0]);
+
+  String content = ;
+  String last = ;
+  char level = 0;
+  bool inTag = false;
+  bool captureText = false;
+  bool anything = false;
+  String tag = ;
+
+  auto unwanted = [&](const String &txt) {
+    String low = txt; low.toLowerCase();
+    for (size_t i = 0; i  N_SKIP; ++i)
+      if (low.startsWith(SKIP_PHRASES[i])) return true;
+    return false;
+  };
+
+  while (in.available()) {
+    char c = in.read();
+    if (!inTag && c == '') {
+      tag = ;
+      inTag = true;
+      continue;
+    }
+    if (inTag) {
+      tag += c;
+      if (c == '') {
+        inTag = false;
+        if (tag.startsWith(h2)  tag.startsWith(h3)) {
+          level = tag.charAt(2);
+          content = ;
+          captureText = true;
+        } else if (captureText &&
+                  ((level == '2' && tag.startsWith(h2)) 
+                   (level == '3' && tag.startsWith(h3)))) {
+          String trimmed = content; trimmed.trim();
+          if (trimmed.length() && !unwanted(trimmed)) {
+            if (!trimmed.equalsIgnoreCase(last)) {
+              if (level == '2') {
+                out.printf(n=== %s ===n, trimmed.c_str());
+              } else {
+                out.printf(- %sn, trimmed.c_str());
+              }
+              last = trimmed;
+              anything = true;
+            }
+          }
+          captureText = false;
+        }
+        tag = ;
+      }
+      continue;
+    }
+    if (captureText) {
+      if (c == 'n'  c == 'r') c = ' ';
+      content += c;
+    }
+  }
+  in.close(); out.close();
+
+  if (anything) {
+    showProgress(✅ Menu saved  + String(dstFile));
+  } else {
+    showProgress(⚠️ No headings found!);
+  }
+}
+
+void showProgress(const String& msg) {
+  Serial.println(msg);
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println(cleanText(msg));
+  display.display();
+}
+
+void loadMenuPagesForCurrentHall() {
+  pages.clear();
+
+  File f = SPIFFS.open(halls[currentHallIndex].file, FILE_READ);
+  if (!f) {
+    pages.push_back({, Error, Menu file missing.});
+    return;
+  }
+
+  String pendingTitle = ;
+  String pendingDishes = ;
+  String currentMealLetter = B;  default
+  String lastMealLetter = B;
+
+  while (f.available()) {
+    String line = f.readStringUntil('n');
+    line.trim();
+
+    if (line.startsWith(===)) {
+      String heading = line;
+      heading.replace(=, );
+      heading.trim();
+
+      bool isMealHeading = false;
+      if (heading.equalsIgnoreCase(BREAKFAST)) {
+        currentMealLetter = B;
+        isMealHeading = true;
+      } else if (heading.equalsIgnoreCase(LUNCH)) {
+        currentMealLetter = L;
+        isMealHeading = true;
+      } else if (heading.equalsIgnoreCase(DINNER)) {
+        currentMealLetter = D;
+        isMealHeading = true;
+      }
+
+      if (isMealHeading) {
+        if (!pendingTitle.isEmpty() && !pendingDishes.isEmpty()) {
+          pages.push_back({lastMealLetter, pendingTitle, pendingDishes});
+        }
+        pendingTitle = ;
+        pendingDishes = ;
+        lastMealLetter = currentMealLetter;
+      } else {
+        if (!pendingTitle.isEmpty() && !pendingDishes.isEmpty()) {
+          pages.push_back({lastMealLetter, pendingTitle, pendingDishes});
+        }
+        pendingTitle = heading;
+        pendingDishes = ;
+      }
+    } else if (line.startsWith(-)) {
+      String dish = line.substring(1);
+      dish.trim();
+      pendingDishes += dish +  • ;
+    }
+  }
+
+  if (!pendingTitle.isEmpty() && !pendingDishes.isEmpty()) {
+    pages.push_back({lastMealLetter, pendingTitle, pendingDishes});
+  }
+
+  f.close();
+
+  if (pages.empty()) {
+    pages.push_back({, Empty, No data.});
+  }
+
+  currentPageIndex = 0;
+}
+
+String getCurrentMealLetter() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return B;
+
+  int hour = timeinfo.tm_hour;
+
+  if (hour = 21  hour  10) return B;
+  if (hour  15) return L;
+  return D;
+}
+
+void setPageForCurrentMeal() {
+  String mealLetter = getCurrentMealLetter();
+  for (size_t i = 0; i  pages.size(); i++) {
+    if (pages[i].mealLetter == mealLetter) {
+      currentPageIndex = i;
+      return;
+    }
+  }
+  currentPageIndex = 0;
+}
+
+String cleanText(String s) {
+  String out = ;
+  for (size_t i = 0; i  s.length(); i++) {
+    char c = s.charAt(i);
+    if (c = 32 && c = 126) {
+      out += c;
+    }
+  }
+  return out;
+}

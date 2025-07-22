@@ -1,0 +1,248 @@
+/*  UCLA Dining – multi-hall scraper  (ESP32-C3 ready)
+ *  --------------------------------------------------
+ *  • Downloads bruin-plate, epicuria-at-covel, de-neve-dining
+ *    and streams every page straight to SPIFFS (/dump.html)
+ *  • While streaming the file back, extracts all <h2>/<h3>
+ *    into a compact   *.menu   file (1-2 kB each, no dups)
+ *  • Skip phrases list removes “Icon Legend”, “Location …”,
+ *    “Today’s Dining Hours”, “Address”… before writing.
+ *
+ *  Tested boards: ESP32-DevKit-C (Vroom-32 LX6)  &  ESP32-C3-DevKitM-1
+ *  Core: Arduino-ESP32 3.2.0
+ */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <SPIFFS.h>
+
+#if defined(USE_EAP)            // <<<—— remove for the C3
+  #include <esp_eap_client.h>
+#endif
+
+/* ---------- SSIDs ---------- */
+#define LOCAL_SSID  "duke_may-2p4G"
+#define LOCAL_PASS  "6217689ab"
+
+/* ---------- eduroam (optional) ---------- */
+#if defined(USE_EAP)
+#define EAP_ANON "anon@ucla.edu"
+#define EAP_IDENTITY "your_email"
+#define EAP_PASSWORD "your_password"
+const char *WIFI_SSID = "SSID";
+const char *WIFI_PSK  = "password";
+#endif
+
+/* ---------- dining halls ---------- */
+struct Hall {
+  const char *slug;     // URL path piece & file stem
+  const char *out;      // compact menu file
+} halls[] = {
+  { "bruin-plate",        "/bplate.menu" },
+  { "epicuria-at-covel",  "/covel.menu"  },
+  { "de-neve-dining",     "/deneve.menu" }
+};
+
+const char *host = "dining.ucla.edu";
+
+/* ---------- skip phrases ---------- */
+const char *SKIP[] = {
+  "icon legend",
+  "location &", "location &",
+  "fresh, local, sustainable meals",
+  "farm to table",
+  "today’s dining hours",
+  "today's dining hours",
+  "address"
+};
+const size_t N_SKIP = sizeof(SKIP)/sizeof(SKIP[0]);
+
+/* ==================================================================== */
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  /* SPIFFS ----------------------------------------------------------- */
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ SPIFFS mount failed");
+    while (1);
+  }
+  FSInfo64 fsi;  SPIFFS.info64(fsi);
+  Serial.printf("✅ SPIFFS mounted (%.0f kB free)\n",
+                (double)(fsi.totalBytes - fsi.usedBytes)/1024.0);
+
+  /* Wi-Fi ------------------------------------------------------------ */
+  connectLocal();
+
+  /* Loop over the three halls --------------------------------------- */
+  for (const Hall &h : halls) {
+    String path = "/" + String(h.slug) + "/";
+    Serial.printf("\n◆ %s → %s\n", path.c_str(), h.out);
+
+    if (downloadPage(path) && extractMenu(h.out))
+      Serial.printf("✅ compact menu saved ➜ %s\n", h.out);
+    else
+      Serial.printf("⚠️  could not build %s\n", h.out);
+  }
+
+  /* show results ----------------------------------------------------- */
+  Serial.println("\n────────────── ALL MENUS ──────────────");
+  for (const Hall &h : halls) showFile(h.out);
+  Serial.println("───────────────────────────────────────");
+}
+
+void loop() {}
+
+/* ==================================================================== */
+/*  Wi-Fi helpers                                                       */
+/* ==================================================================== */
+
+void connectLocal() {
+  Serial.print("Connecting to Wi-Fi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(LOCAL_SSID, LOCAL_PASS);
+  while (WiFi.status() != WL_CONNECTED) { Serial.print('.'); delay(300); }
+  Serial.printf("\n✅ Connected  –  IP %s\n", WiFi.localIP().toString().c_str());
+}
+
+#if defined(USE_EAP)
+void connectEduroam() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("eduroam", WPA2_AUTH_PEAP,
+             EAP_ANON, EAP_ID, EAP_PASS);
+  while (WiFi.status() != WL_CONNECTED) { Serial.print('.'); delay(300); }
+  Serial.println("\n✅ eduroam OK");
+}
+#endif
+
+/* ==================================================================== */
+/*  1) HTTPS download  (stream → /dump.html)                            */
+/* ==================================================================== */
+
+bool downloadPage(const String &urlPath) {
+  WiFiClientSecure cli;
+  cli.setInsecure();                       // no CA, small RAM
+
+  Serial.printf("🌐 GET https://%s%s\n", host, urlPath.c_str());
+  if (!cli.connect(host, 443, 10000)) {
+    Serial.println("❌ TLS connect failed");
+    return false;
+  }
+
+  cli.printf(
+    "GET %s HTTP/1.1\r\nHost: %s\r\n"
+    "User-Agent: esp32-c3\r\n"
+    "Accept: text/html\r\nConnection: close\r\n\r\n",
+    urlPath.c_str(), host
+  );
+
+  /* skip headers ---------------------------------------------------- */
+  if (!cli.find("\r\n\r\n")) { cli.stop(); return false; }
+
+  /* write body to /dump.html ---------------------------------------- */
+  File dump = SPIFFS.open("/dump.html", FILE_WRITE);
+  if (!dump) { Serial.println("❌ dump.html open failed"); cli.stop(); return false; }
+
+  const uint32_t CHUNK = 40960;  // status print interval
+  uint32_t total = 0, nextMark = CHUNK;
+
+  while (cli.connected() || cli.available()) {
+    int c = cli.read();                    // -1 handled by loop cond
+    if (c >= 0) {
+      dump.write((uint8_t)c);
+      if (++total >= nextMark) {
+        Serial.printf("📄 Downloaded %u bytes…\n", total);
+        nextMark += CHUNK;
+      }
+    }
+  }
+  dump.close();  cli.stop();
+
+  Serial.printf("📦 Downloaded %u bytes.\n", total);
+  return total > 0;
+}
+
+/* ==================================================================== */
+/*  2) streaming parse  /dump.html  ➜  *.menu                           */
+/* ==================================================================== */
+
+bool extractMenu(const char *outFile) {
+  File in  = SPIFFS.open("/dump.html", FILE_READ);
+  if (!in) { Serial.println("❌ dump.html missing"); return false; }
+
+  File out = SPIFFS.open(outFile, FILE_WRITE);
+  if (!out) { Serial.println("❌ menu file open failed"); in.close(); return false; }
+
+  enum { NONE, TAG_H2, TAG_H3 } state = NONE;
+  String buf, lastLine;
+  bool wroteSomething = false;
+
+  while (in.available()) {
+    char c = in.read();
+
+    /* crude HTML state machine -------------------------------------- */
+    if (c == '<') {                         // possible tag start
+      buf = "";
+      char t[4];    // hold up to "<h3"
+      t[0] = in.read(); t[1] = in.read();
+      if (t[0]=='h' && (t[1]=='2'||t[1]=='3')) {
+        state = (t[1]=='2') ? TAG_H2 : TAG_H3;
+        // consume rest of opening tag
+        while (in.available() && in.read()!='>') ;
+      }
+      else state = NONE;
+      continue;
+    }
+    if (state==TAG_H2 || state==TAG_H3) {
+      if (c=='<') {                         // closing tag begins
+        String line = buf;
+        line.trim();  line.toLowerCase();
+        if (line.length()) {
+          /* skip unwanted phrases ---------------------------------- */
+          bool skip=false;
+          for (size_t i=0;i<N_SKIP && !skip;i++)
+            if (line.startsWith(SKIP[i])) skip=true;
+          /* drop identical line repeated twice in a row ------------ */
+          if (!skip && line!=lastLine) {
+            lastLine = line;
+            if (state==TAG_H2) {
+              out.printf("\n=== %s ===\n", line.c_str());
+              Serial.print("=== "); Serial.print(line); Serial.println(" ===");
+            } else {
+              out.printf("- %s\n", line.c_str());
+              Serial.print("- "); Serial.println(line);
+            }
+            wroteSomething = true;
+          }
+        }
+        state = NONE;
+        // skip to '>' of closing tag
+        while (in.available() && in.read()!='>') ;
+      } else {
+        buf += c;                           // accumulate text inside h2/h3
+      }
+    }
+  }
+  in.close(); out.close();
+
+  if (!wroteSomething) {
+    Serial.println("⚠️  nothing captured – patterns off?");
+    SPIFFS.remove(outFile);
+  } else {
+    Serial.printf("✅ compact menu saved ➜ %s  (%u bytes)\n",
+                  outFile, (unsigned)SPIFFS.open(outFile).size());
+  }
+  return wroteSomething;
+}
+
+/* ==================================================================== */
+/*  Show a saved file over Serial                                       */
+/* ==================================================================== */
+
+void showFile(const char *path) {
+  File f = SPIFFS.open(path, FILE_READ);
+  Serial.printf("\n◆ %s  (%u bytes)\n\n", path, (unsigned)f.size());
+  while (f.available()) Serial.write(f.read());
+  f.close();
+  Serial.println("\n────────────────────────────────────────");
+}

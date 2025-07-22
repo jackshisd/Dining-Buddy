@@ -1,0 +1,282 @@
+/*──────────────────────────────────────────────────────────────
+  UCLA Dining scraper  ▸ 3 halls ➜ 3 *.menu files
+  Works on ESP32-C3 / -S3  (Arduino-ESP32 v3.2.0)
+──────────────────────────────────────────────────────────────*/
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <SPIFFS.h>
+#include <esp_eap_client.h>
+
+/* ---------- Wi-Fi ---------- */
+#define EAP_ANON "anon@ucla.edu"
+#define EAP_IDENTITY "your_email"
+#define EAP_PASSWORD "your_password"
+const char *WIFI_SSID = "SSID";
+const char *WIFI_PSK  = "password";
+
+/* ---------- dining halls ---------- */
+struct Hall {
+  const char *host;
+  const char *path;
+  const char *file;                  // compact output
+} halls[] = {
+  { "dining.ucla.edu", "/bruin-plate/",       "/bplate.menu" },
+  { "dining.ucla.edu", "/epicuria-at-covel/", "/covel.menu"  },
+  { "dining.ucla.edu", "/de-neve-dining/",    "/deneve.menu" }
+};
+
+/* ---------- prototypes ---------- */
+void connectLocalWiFi(const char*, const char*);
+void connectEduroam();
+bool  downloadPage(const char *host, const char *path);   // ➜ /dump.html
+void  extractMenu(const char *dstFile);                   // /dump.html ➜ *.menu
+void  showFile(const char *file);
+
+/* ============================================================ */
+void setup()
+{
+  Serial.begin(115200);
+  delay(400);
+
+  /* ─ SPIFFS ─ */
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ SPIFFS mount failed!");
+    while (1);
+  }
+  Serial.printf("✅ SPIFFS mounted (%u kB free)\n",
+         (SPIFFS.totalBytes() - SPIFFS.usedBytes()) / 1024);
+
+  /* ─ Wi-Fi ─ */
+  //connectLocalWiFi(LOCAL_SSID, LOCAL_PASS);
+   connectEduroam();
+
+  /* ─ scrape every hall ─ */
+  for (Hall &h : halls) {
+    Serial.printf("\n◆ %s → %s\n", h.path, h.file);
+    if (downloadPage(h.host, h.path)) {
+      Serial.println("✅ HTML saved, parsing…");
+      extractMenu(h.file);
+    } else {
+      Serial.println("❌ download failed – skipped.");
+    }
+  }
+
+  /* ─ dump compact menus ─ */
+  Serial.println("\n────────────────── ALL MENUS ──────────────────");
+  for (Hall &h : halls) {
+    showFile(h.file);
+    Serial.println("───────────────────────────────────────────────");
+  }
+}
+
+void loop() {}
+
+/* ----------------------------------------------------------- */
+/*  Wi-Fi helpers                                              */
+/* ----------------------------------------------------------- */
+void connectLocalWiFi(const char *ssid, const char *pwd)
+{
+  Serial.print("Connecting to Wi-Fi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pwd);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(350);
+  }
+  Serial.printf("\n✅ Connected  –  IP %s\n", WiFi.localIP().toString().c_str());
+}
+
+void connectEduroam()
+{
+  Serial.print("Connecting to eduroam");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("eduroam", WPA2_AUTH_PEAP,
+             EAP_ANON, EAP_ID, EAP_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(350);
+  }
+  Serial.printf("\n✅ Connected  –  IP %s\n", WiFi.localIP().toString().c_str());
+}
+
+/* ----------------------------------------------------------- */
+/* 1) Download raw HTML to /dump.html                          */
+/* ----------------------------------------------------------- */
+bool downloadPage(const char *host, const char *path)
+{
+  WiFiClientSecure cli;
+  cli.setInsecure();
+
+  Serial.printf("🌐 GET https://%s%s\n", host, path);
+  if (!cli.connect(host, 443, 10000)) {
+    Serial.println("❌ TLS connect failed");
+    return false;
+  }
+  cli.printf(
+    "GET %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "User-Agent: ESP32-MenuScraper\r\n"
+    "Accept: text/html\r\n"
+    "Connection: close\r\n\r\n", path, host);
+
+  /* ---- skip headers ---- */
+  String status = cli.readStringUntil('\n');
+  int    code   = status.substring(9, 12).toInt();
+  String loc;
+  while (cli.connected()) {
+    String h = cli.readStringUntil('\n');
+    h.trim();
+    if (h.length() == 0) break;
+    if (h.startsWith("Location:")) loc = h.substring(9);
+  }
+  /* ---- follow ONE redirect ---- */
+  if ((code == 301 || code == 302) && loc.length()) {
+    cli.stop();
+    loc.trim();
+    if (loc.startsWith("http")) {
+      int s = loc.indexOf('/', loc.indexOf("://") + 3);
+      String nHost = loc.substring(loc.indexOf("://") + 3, s);
+      String nPath = loc.substring(s);
+      return downloadPage(nHost.c_str(), nPath.c_str());
+    }
+    return downloadPage(host, loc.c_str());             // relative
+  }
+
+  /* ---- stream body to flash ---- */
+  File out = SPIFFS.open("/dump.html", FILE_WRITE);
+  if (!out) { Serial.println("❌ can't create /dump.html"); cli.stop(); return false; }
+
+  size_t total = 0; uint32_t last = millis();
+  while (cli.connected() || cli.available()) {
+    while (cli.available()) {
+      out.write(cli.read());
+      ++total;
+      if (total % 8192 == 0 && millis() - last > 1500) {
+        Serial.printf("📄 Downloaded %u bytes…\n", total);
+        last = millis();
+      }
+    }
+  }
+  out.close(); cli.stop();
+  Serial.printf("📦 Downloaded %u bytes.\n", total);
+  return total > 0;
+}
+
+/* ----------------------------------------------------------- */
+/* 2) streaming parse  /dump.html  ➜  compact *.menu files      */
+/* ----------------------------------------------------------- */
+void extractMenu(const char *dstFile)
+{
+  File in  = SPIFFS.open("/dump.html", FILE_READ);
+  if (!in) { Serial.println("❌ /dump.html missing!"); return; }
+
+  File out = SPIFFS.open(dstFile, FILE_WRITE);
+  if (!out) { Serial.println("❌ can't create compact file"); in.close(); return; }
+
+  /* --- phrases we don’t want in the final menu ---------------- */
+  const char *SKIP_PHRASES[] = {
+    "icon legend",
+    "location &",            // “location & contact information”
+    "farm to table",
+    "fresh, local, sustainable meals",
+    "today’s dining hours",  // curly apostrophe
+    "today's dining hours",  // straight apostrophe
+    "address"
+  };
+  constexpr size_t N_SKIP = sizeof(SKIP_PHRASES) / sizeof(SKIP_PHRASES[0]);
+
+  String content = "";
+  String last    = "";
+  char   level   = 0;
+  bool   inTag        = false;
+  bool   captureText  = false;
+  bool   anything     = false;
+  String tag = "";
+
+  auto unwanted = [&](const String &txt) {
+    String low = txt; low.toLowerCase();
+    for (size_t i = 0; i < N_SKIP; ++i)
+      if (low.startsWith(SKIP_PHRASES[i])) return true;
+    return false;
+  };
+
+  while (in.available()) {
+    char c = in.read();
+
+    /* -------- tag detection -------- */
+    if (!inTag && c == '<') {                    // entering tag
+      tag  = "<";
+      inTag = true;
+      continue;
+    }
+    if (inTag) {
+      tag += c;
+      if (c == '>') {                            // tag closed
+        inTag = false;
+
+        /* opening <h2>/<h3> */
+        if (tag.startsWith("<h2") || tag.startsWith("<h3")) {
+          level = tag.charAt(2);                 // '2' or '3'
+          content = "";
+          captureText = true;
+        }
+        /* closing </h2>/<h3> */
+        else if (captureText &&
+                 ((level == '2' && tag.startsWith("</h2")) ||
+                  (level == '3' && tag.startsWith("</h3")))) {
+
+          String trimmed = content; trimmed.trim();
+
+          if (trimmed.length() &&
+              !unwanted(trimmed)) {
+
+            /* drop only *adjacent* duplicates so
+               the same item can re-appear under a
+               different <h2> category */
+            if (!trimmed.equalsIgnoreCase(last)) {
+              if (level == '2') {
+                out.printf("\n=== %s ===\n", trimmed.c_str());
+                Serial.printf("\n=== %s ===\n", trimmed.c_str());
+              } else {
+                out.printf("- %s\n", trimmed.c_str());
+                Serial.printf("- %s\n", trimmed.c_str());
+              }
+              last = trimmed;
+              anything = true;
+            }
+          }
+          captureText = false;
+        }
+        tag = "";
+      }
+      continue;                                  // stay inside tag
+    }
+
+    /* -------- plain text -------- */
+    if (captureText) {
+      if (c == '\n' || c == '\r') c = ' ';       // normalize EOL
+      content += c;
+    }
+  }
+  in.close(); out.close();
+
+  if (anything)
+    Serial.printf("✅ compact menu saved ➜ %s  (%u bytes)\n",
+                  dstFile, SPIFFS.open(dstFile).size());
+  else
+    Serial.println("⚠️  no headings captured – check parser.");
+}
+
+/* ----------------------------------------------------------- */
+/* 3) helper: echo a file to Serial                             */
+/* ----------------------------------------------------------- */
+void showFile(const char *file)
+{
+  File f = SPIFFS.open(file, FILE_READ);
+  if (!f) { Serial.printf("❌ %s not found\n", file); return; }
+
+  Serial.printf("\n◆ %s  (%u bytes)\n", file, f.size());
+  while (f.available()) Serial.write(f.read());
+  f.close();
+  Serial.println();
+}
