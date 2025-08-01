@@ -14,6 +14,10 @@ All interaction is handled with a **single button**, and menu data is stored in 
 ### Prototype  
 <img src="pictures/prototype.png" alt="Prototype" width="500"/>
 
+### Finished Keychain 
+<img src="pictures/constructed1.png" alt="Prototype" width="500"/>
+<img src="pictures/constructed2.png" alt="Prototype" width="500"/>
+
 ### Finished Solder Assembly  
 <img src="pictures/front.png" alt="Front" width="500"/>
 <img src="pictures/back.png" alt="Back" width="500"/>
