@@ -1,7 +1,7 @@
 # Dining Buddy v6.3  
 **ESP32-C3 OLED Keychain for UCLA Dining Menus + Weather Display**
 
-## 🆕 Newest Features
+## 🆕 Newest Features 6.0 -> 6.3
 
 -  **Safe Wi-Fi Shutdown:** Device now safely enters deep sleep when unable to connect to Wi-Fi.
 -  **Manual Wi-Fi Retry:** Long press the button to retry Wi-Fi connection without rebooting.
