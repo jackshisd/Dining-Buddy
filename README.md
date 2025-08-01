@@ -12,19 +12,19 @@ All interaction is handled with a **single button**, and menu data is stored in 
 ## Photos
 
 ### Prototype  
-<img src="prototype.png" alt="Prototype" width="500"/>
+<img src="pictures/prototype.png" alt="Prototype" width="500"/>
 
 ### Finished Solder Assembly  
-<img src="front.png" alt="Front" width="500"/>
-<img src="back.png" alt="Back" width="500"/>
-<img src="side.png" alt="Side" width="500"/>
+<img src="pictures/front.png" alt="Front" width="500"/>
+<img src="pictures/back.png" alt="Back" width="500"/>
+<img src="pictures/side.png" alt="Side" width="500"/>
 
 ### Schematic  
-<img src="schematic.png" alt="Schematic" width="500"/>
+<img src="pictures/schematic.png" alt="Schematic" width="500"/>
 
 ### PCB  
-<img src="pcb1.png" alt="PCB Top" width="500"/>
-<img src="pcb2.png" alt="PCB Bottom" width="500"/>
+<img src="pictures/pcb1.png" alt="PCB Top" width="500"/>
+<img src="pictures/pcb2.png" alt="PCB Bottom" width="500"/>
 
 
 
