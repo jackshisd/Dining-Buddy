@@ -1,0 +1,1004 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <SPIFFS.h>
+#include <time.h>
+#include <esp_sleep.h>
+#include <esp_eap_client.h>
+
+/* ---------- Wi-Fi ---------- */
+#define EAP_ANON "anon@ucla.edu"
+#define EAP_ID "your_email"
+#define EAP_PASS "yeur_password"
+const char *LOCAL_SSID = "ssid";
+const char *LOCAL_PASS  = "pass";
+
+/* ---------- OLED ---------- */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+/* ---------- BUTTON ---------- */
+const int BUTTON_PIN = 2;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONGPRESS_MS = 600;
+const unsigned long DOUBLECLICK_MS = 400;
+
+/* ---------- LED ---------- */
+const int LED_PIN = 21; // Choose your GPIO
+RTC_DATA_ATTR bool wifiFailed = false;
+
+
+/* ---------- State Vars ---------- */
+bool lastButtonState = HIGH;
+bool buttonState = HIGH;
+unsigned long lastDebounceTime = 0;
+
+unsigned long pressStartTime = 0;
+bool longPressDetected = false;
+
+unsigned long lastInteractionTime = 0;
+
+int clickCount = 0;
+unsigned long lastClickTime = 0;
+
+/* ---------- Modes ---------- */
+enum Mode {
+  MODE_NORMAL,
+  MODE_DATE_SELECT,
+  MODE_WEATHER
+};
+
+Mode currentMode = MODE_NORMAL;
+
+/* ---------- RTC Vars ---------- */
+RTC_DATA_ATTR time_t lastMenuFetch = 0;
+
+/* ---------- Dining Halls ---------- */
+struct Hall {
+  const char *name;
+  const char *host;
+  const char *pathBase;
+  const char *fileToday;
+} halls[] = {
+  { "Bruin Plate", "dining.ucla.edu", "/bruin-plate/", "/bplate.menu" },
+  { "Epicuria",    "dining.ucla.edu", "/epicuria-at-covel/", "/covel.menu" },
+  { "De Neve",     "dining.ucla.edu", "/de-neve-dining/", "/deneve.menu" },
+  { "Rendezvous",  "dining.ucla.edu", "/rendezvous/", "/rendezvous.menu" }
+};
+
+const int NUM_HALLS = sizeof(halls) / sizeof(halls[0]);
+int currentHallIndex = 0;
+
+/* ---------- Menu Pages ---------- */
+struct MenuPage {
+  String mealLetter;
+  String title;
+  String scrollingText;
+};
+
+std::vector<MenuPage> pages;
+int currentPageIndex = 0;
+
+/* ---------- Scrolling ---------- */
+int scrollOffset = 0;
+unsigned long lastScroll = 0;
+const int SCROLL_SPEED_MS = 100;
+
+String headerScrollText = "";
+int headerScrollOffset = 0;
+unsigned long headerLastScroll = 0;
+const int HEADER_SCROLL_SPEED_MS = 150;
+
+/* ---------- Weather/Date ---------- */
+String currentWeather = "";
+String currentDate = "";
+String currentTimeStr = "";
+unsigned long lastWeatherRefresh = 0;
+const unsigned long WEATHER_REFRESH_MS = 10 * 60 * 1000UL;
+
+/* ---------- Date Select Vars ---------- */
+String selectedDate = "";
+int selectedDayIndex = 0;
+int dateSelectScroll = 0;
+
+/* ---------- Prototypes ---------- */
+void connectEduroam();
+void connectLocalWiFi(const char *ssid, const char *pwd);
+bool downloadPage(const char*, const char*);
+void extractMenu(const char*);
+void loadMenuPagesForCurrentHall();
+void showCurrentPage();
+void scrollText();
+void handleButton();
+void handleClick();
+void shortPressAction();
+void longPressAction();
+void doublePressAction();
+void showWeatherPage();
+void fetchWeather();
+void fetchDateTime();
+void scheduleDeepSleepUntilNightWake();
+void rotateAndFetchMenus();
+String cleanText(String);
+void showProgress(const String&);
+String getCurrentMealLetter();
+void setPageForCurrentMeal();
+bool shouldFetchMenusToday();
+void fetchMenusForNextNDays(int);
+void cleanOldMenus();
+String makeMenuFilename(const Hall &, const String &);
+String getDateString(int);
+String getCompactDate(int);
+String getDayOfWeek(int);
+void showDateSelectScreen();
+void fixInvalidDateFiles();
+
+/* ---------- Setup ---------- */
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Wire.begin(6, 7);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 failed");
+    while (1);
+  }
+display.clearDisplay();
+display.setTextSize(1);
+display.setTextColor(SSD1306_WHITE);
+display.setCursor(0, 0);
+display.println("The Hungry Pager v6.2");
+display.println("booting...");
+display.display();
+
+  if (!SPIFFS.begin(true)) {
+    showProgress("SPIFFS failed!");
+    while (1);
+  }
+
+  if(wifiFailed){
+    digitalWrite(LED_PIN, HIGH);
+    showProgress("WiFi failed - LED ON\nReset to retry 😢");
+    while (1) { delay(1000); } // Stay awake with LED on
+  }
+
+  configTzTime("PST8PDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
+  delay(800);
+
+  esp_sleep_wakeup_cause_t reason = esp_sleep_get_wakeup_cause();
+  switch (reason) {
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println("Wakeup by TIMER");
+      if (!connectLocalWiFi(LOCAL_SSID, LOCAL_PASS, 30000)) {
+        scheduleDeepSleepUntilNightWake();
+        return;
+      }
+      rotateAndFetchMenus();
+      lastMenuFetch = time(NULL);
+      WiFi.disconnect(true);
+      break;
+
+    case ESP_SLEEP_WAKEUP_GPIO:
+      Serial.println("Wakeup by GPIO");
+      break;
+
+    default:
+      Serial.printf("Cold boot: %d\n", reason);
+      if (!connectLocalWiFi(LOCAL_SSID, LOCAL_PASS, 30000)) {
+        scheduleDeepSleepUntilNightWake();
+        return;
+      }
+      fetchMenusForNextNDays(5);
+      lastMenuFetch = time(NULL);
+      WiFi.disconnect(true);
+      break;
+  }
+
+  cleanOldMenus();
+
+  selectedDate = getDateString(0);
+  loadMenuPagesForCurrentHall();
+  setPageForCurrentMeal();
+  showCurrentPage();
+  lastInteractionTime = millis();
+}
+
+/* ---------- Loop ---------- */
+
+void loop() {
+  handleButton();
+
+  if (currentMode == MODE_WEATHER) {
+    if (millis() - lastWeatherRefresh > WEATHER_REFRESH_MS) {
+      if (!connectLocalWiFi(LOCAL_SSID, LOCAL_PASS, 30000)) {
+        scheduleDeepSleepUntilNightWake();
+        return;
+      }
+      fetchDateTime();
+      fetchWeather();
+      lastWeatherRefresh = millis();
+    }
+    showWeatherPage();
+  } else if (currentMode == MODE_DATE_SELECT) {
+    // nothing
+  } else {
+    scrollText();
+  }
+
+  if (currentMode == MODE_NORMAL && millis() - lastInteractionTime > 30000) {
+    scheduleDeepSleepUntilNightWake();
+  }
+}
+
+/* ---------- Midnight Logic ---------- */
+
+void scheduleDeepSleepUntilNightWake() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    wifiFailed = true;
+    //Serial.println("No time info. Skipping sleep.");
+    // Turn off display to save power
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+
+  //esp_sleep_enable_timer_wakeup(secondsUntilWake * 1000000ULL);
+
+  esp_deep_sleep_enable_gpio_wakeup(
+      1ULL << GPIO_NUM_2,
+      ESP_GPIO_WAKEUP_GPIO_LOW
+  );
+
+  esp_deep_sleep_start();
+  }
+
+  timeinfo.tm_hour = 2;
+  timeinfo.tm_min  = 30;
+  timeinfo.tm_sec  = 0;
+
+  time_t targetWake = mktime(&timeinfo);
+  if (targetWake <= time(NULL)) {
+    targetWake += 86400;
+  }
+
+  time_t secondsUntilWake = targetWake - time(NULL);
+
+  if (secondsUntilWake < 30) {
+    secondsUntilWake = 86400;
+  }
+
+  Serial.printf("Sleeping %ld seconds until 2:30 AM\n", secondsUntilWake);
+
+  // Turn off display to save power
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+
+  esp_sleep_enable_timer_wakeup(secondsUntilWake * 1000000ULL);
+
+  esp_deep_sleep_enable_gpio_wakeup(
+      1ULL << GPIO_NUM_2,
+      ESP_GPIO_WAKEUP_GPIO_LOW
+  );
+
+  esp_deep_sleep_start();
+}
+
+
+
+
+void rotateAndFetchMenus() {
+
+  showProgress("Rotate + fetch...");
+
+  String today = getDateString(0);   // 2025-07-10
+  String day6  = getDateString(5);   // 2025-07-15
+
+  for (int h = 0; h < NUM_HALLS; h++) {
+
+    String todayFile       = halls[h].fileToday;          // /bplate.menu
+    String todayFutureFile = makeMenuFilename(halls[h], today); // /bplate_2025-07-10.menu
+    bool   haveToday       = false;
+
+    // If we *do* have the dated copy, rotate it in
+    if (SPIFFS.exists(todayFutureFile)) {
+
+      if (SPIFFS.exists(todayFile)) SPIFFS.remove(todayFile);
+      if (SPIFFS.rename(todayFutureFile, todayFile)) {
+        haveToday = true;
+        showProgress("Rotated " + todayFutureFile);
+      }
+    }
+
+    // If rotation failed, download today explicitly
+    if (!haveToday) {
+      String path = String(halls[h].pathBase) + "?date=" + today;
+      showProgress(String("DL today ") + halls[h].name);
+      if (downloadPage(halls[h].host, path.c_str())) {
+        extractMenu(todayFile.c_str());
+      }
+    }
+  }
+
+  // --- grab the new 6th-day menu ---
+  for (int h = 0; h < NUM_HALLS; h++) {
+    String path = String(halls[h].pathBase) + "?date=" + day6;
+    String file = makeMenuFilename(halls[h], day6);
+    showProgress(String("DL +6 ") + halls[h].name);
+    if (downloadPage(halls[h].host, path.c_str())) extractMenu(file.c_str());
+  }
+
+  showProgress("✅ rotation done");
+}
+
+
+
+/* ---------- Existing Functions ---------- */
+
+String makeMenuFilename(const Hall &h, const String &dateStr) {
+  String base = h.name;
+  base.toLowerCase();
+  base.replace(" ", "");
+  return "/" + base + "_" + dateStr + ".menu";
+}
+
+String getDateString(int offsetDays) {
+  time_t t = time(NULL) + offsetDays * 86400;
+  struct tm tm;
+  localtime_r(&t, &tm);
+  char buf[11];
+  strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+  return String(buf);
+}
+
+String getCompactDate(int offset) {
+  time_t now = time(NULL);
+  now += offset * 86400;
+  struct tm *tm = localtime(&now);
+  return String(tm->tm_mon + 1) + "/" + String(tm->tm_mday);
+}
+
+String getDayOfWeek(int offset) {
+  time_t now = time(NULL);
+  now += offset * 86400;
+  struct tm *tm = localtime(&now);
+  char buf[10];
+  strftime(buf, sizeof(buf), "%a", tm);
+  return String(buf);
+}
+
+void cleanOldMenus() {
+  String today = getDateString(0);
+  File root = SPIFFS.open("/");
+  while (File file = root.openNextFile()) {
+    String name = file.name();
+    if (name.endsWith(".menu")) {
+      int u = name.lastIndexOf('_');
+      int d = name.lastIndexOf('.');
+      if (u != -1 && d != -1 && d > u) {
+        String datePart = name.substring(u + 1, d);
+        if (datePart < today) {
+          SPIFFS.remove(name);
+          showProgress("Deleted " + name);
+        }
+      }
+    }
+  }
+}
+
+bool shouldFetchMenusToday() {
+  fetchDateTime();
+  struct tm nowTime;
+  if (!getLocalTime(&nowTime)) return true;
+  if (lastMenuFetch == 0) return true;
+  struct tm *last = localtime(&lastMenuFetch);
+  return nowTime.tm_yday != last->tm_yday;
+}
+
+void fetchMenusForNextNDays(int numDays) {
+  for (int i = 0; i <= numDays; i++) {
+    String dateStr = getDateString(i);
+    for (Hall &h : halls) {
+      String path;
+      String fileName;
+      if (i == 0) {
+        path = h.pathBase;
+        fileName = h.fileToday;
+      } else {
+        path = String(h.pathBase) + "?date=" + dateStr;
+        fileName = makeMenuFilename(h, dateStr);
+      }
+      showProgress("DL " + String(h.name) + " " + dateStr);
+      if (downloadPage(h.host, path.c_str())) {
+        extractMenu(fileName.c_str());
+      } else {
+        showProgress("DL fail: " + String(h.name) + " " + dateStr);
+      }
+    }
+  }
+  showProgress("✅ Done fetching menus.");
+}
+
+bool connectLocalWiFi(const char *ssid, const char *pwd, unsigned long timeoutMs) {
+  showProgress("Connecting Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pwd);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(350);
+    if (millis() - startAttempt > timeoutMs) {
+      showProgress("Wi-Fi timeout");
+      return false;
+    }
+  }
+  showProgress("IP: " + WiFi.localIP().toString());
+  return true;
+}
+
+void connectLocalWiFi(const char *ssid, const char *pwd) { // legacy wrapper for old calls
+  connectLocalWiFi(ssid, pwd, 30000);
+}
+
+bool connectEduroam(unsigned long timeoutMs) {
+  showProgress("Connecting eduroam...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("eduroam", WPA2_AUTH_PEAP,
+             EAP_ANON, EAP_ID, EAP_PASS);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(350);
+    if (millis() - startAttempt > timeoutMs) {
+      showProgress("Wi-Fi timeout");
+      return false;
+    }
+  }
+  showProgress("IP: " + WiFi.localIP().toString());
+  return true;
+}
+
+void connectEduroam() { // legacy wrapper for old calls
+  connectEduroam(30000);
+}
+
+void showProgress(const String& msg) {
+  Serial.println(msg);
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println("The Hungry Pager v5.0");
+  display.println(cleanText(msg));
+  display.display();
+}
+
+void extractMenu(const char *dstFile) {
+  File in = SPIFFS.open("/dump.html", FILE_READ);
+  if (!in) {
+    showProgress("/dump.html missing!");
+    return;
+  }
+
+  File out = SPIFFS.open(dstFile, FILE_WRITE);
+  if (!out) {
+    showProgress("Can't create compact file.");
+    in.close();
+    return;
+  }
+
+  const char *SKIP_PHRASES[] = {
+    "icon legend", "location &",
+    "farm to table", "fresh, local, sustainable meals",
+    "today’s dining hours", "today's dining hours", "address"
+  };
+  constexpr size_t N_SKIP = sizeof(SKIP_PHRASES) / sizeof(SKIP_PHRASES[0]);
+
+  String content = "";
+  String last = "";
+  char level = 0;
+  bool inTag = false;
+  bool captureText = false;
+  bool anything = false;
+  String tag = "";
+
+  auto unwanted = [&](const String &txt) {
+    String low = txt; low.toLowerCase();
+    for (size_t i = 0; i < N_SKIP; ++i)
+      if (low.startsWith(SKIP_PHRASES[i])) return true;
+    return false;
+  };
+
+  while (in.available()) {
+    char c = in.read();
+    if (!inTag && c == '<') {
+      tag = "<";
+      inTag = true;
+      continue;
+    }
+    if (inTag) {
+      tag += c;
+      if (c == '>') {
+        inTag = false;
+        if (tag.startsWith("<h2") || tag.startsWith("<h3")) {
+          level = tag.charAt(2);
+          content = "";
+          captureText = true;
+        } else if (captureText &&
+                  ((level == '2' && tag.startsWith("</h2")) ||
+                   (level == '3' && tag.startsWith("</h3")))) {
+          String trimmed = content; trimmed.trim();
+          if (trimmed.length() && !unwanted(trimmed)) {
+            if (!trimmed.equalsIgnoreCase(last)) {
+              if (level == '2') {
+                out.printf("\n=== %s ===\n", trimmed.c_str());
+              } else {
+                out.printf("- %s\n", trimmed.c_str());
+              }
+              last = trimmed;
+              anything = true;
+            }
+          }
+          captureText = false;
+        }
+        tag = "";
+      }
+      continue;
+    }
+    if (captureText) {
+      if (c == '\n' || c == '\r') c = ' ';
+      content += c;
+    }
+  }
+  in.close(); out.close();
+
+  if (anything) {
+    showProgress("✅ Menu saved: " + String(dstFile));
+  } else {
+    showProgress("️ No headings found!");
+  }
+}
+
+String cleanText(String s) {
+  String out = "";
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c >= 32 && c <= 126) {
+      out += c;
+    }
+  }
+  return out;
+}
+
+void fetchDateTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    currentDate = "No RTC";
+    currentTimeStr = "--:--";
+    return;
+  }
+  char dateStr[20];
+  char timeStr[10];
+  strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
+  strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+  currentDate = String(dateStr);
+  currentTimeStr = String(timeStr);
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    currentWeather = "Wi-Fi lost";
+    return;
+  }
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (!client.connect("wttr.in", 443)) {
+    currentWeather = "Weather fail";
+    return;
+  }
+
+  client.print(
+    "GET /?format=3 HTTP/1.1\r\n"
+    "Host: wttr.in\r\n"
+    "User-Agent: ESP32\r\n"
+    "Connection: close\r\n\r\n"
+  );
+
+  bool headersEnded = false;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) {
+      headersEnded = true;
+      break;
+    }
+  }
+
+  if (!headersEnded) {
+    currentWeather = "No weather";
+    return;
+  }
+
+  if (client.available()) {
+    String weatherLine = client.readStringUntil('\n');
+    weatherLine.trim();
+    weatherLine.replace(" :", ":");
+    while (weatherLine.indexOf("  ") != -1) {
+      weatherLine.replace("  ", " ");
+    }
+    currentWeather = cleanText(weatherLine);
+    return;
+  }
+  currentWeather = "No weather";
+}
+
+bool downloadPage(const char *host, const char *path) {
+  WiFiClientSecure cli;
+  cli.setInsecure();
+
+  showProgress("GET https://" + String(host) + String(path));
+  if (!cli.connect(host, 443, 10000)) {
+    showProgress("TLS failed");
+    return false;
+  }
+
+  cli.printf(
+    "GET %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "User-Agent: ESP32-MenuScraper\r\n"
+    "Connection: close\r\n\r\n", path, host);
+
+  String status = cli.readStringUntil('\n');
+  int code = status.substring(9, 12).toInt();
+  String loc;
+  while (cli.connected()) {
+    String h = cli.readStringUntil('\n');
+    h.trim();
+    if (h.length() == 0) break;
+    if (h.startsWith("Location:")) loc = h.substring(9);
+  }
+  if ((code == 301 || 302) && loc.length()) {
+    cli.stop();
+    loc.trim();
+    if (loc.startsWith("http")) {
+      int s = loc.indexOf('/', loc.indexOf("://") + 3);
+      String nHost = loc.substring(loc.indexOf("://") + 3, s);
+      String nPath = loc.substring(s);
+      return downloadPage(nHost.c_str(), nPath.c_str());
+    }
+    return downloadPage(host, loc.c_str());
+  }
+
+  File out = SPIFFS.open("/dump.html", FILE_WRITE);
+  if (!out) {
+    showProgress("Can't create dump.html");
+    cli.stop();
+    return false;
+  }
+
+  while (cli.connected() || cli.available()) {
+    while (cli.available()) {
+      out.write(cli.read());
+    }
+  }
+  out.close();
+  cli.stop();
+  showProgress("✅ Downloaded.");
+  return true;
+}
+
+void loadMenuPagesForCurrentHall() {
+  pages.clear();
+
+  String fileName;
+  if (selectedDayIndex == 0) {
+    fileName = halls[currentHallIndex].fileToday;
+  } else {
+    fileName = makeMenuFilename(halls[currentHallIndex], selectedDate);
+  }
+
+  File f = SPIFFS.open(fileName, FILE_READ);
+  if (!f) {
+    pages.push_back({"", "Error", "Menu missing."});
+    return;
+  }
+
+  String pendingTitle = "";
+  String pendingDishes = "";
+  String currentMealLetter = "B";
+  String lastMealLetter = "B";
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("===")) {
+      String heading = line;
+      heading.replace("=", "");
+      heading.trim();
+
+      bool isMeal = false;
+      if (heading.equalsIgnoreCase("BREAKFAST")) {
+        currentMealLetter = "B";
+        isMeal = true;
+      } else if (heading.equalsIgnoreCase("LUNCH")) {
+        currentMealLetter = "L";
+        isMeal = true;
+      } else if (heading.equalsIgnoreCase("DINNER")) {
+        currentMealLetter = "D";
+        isMeal = true;
+      }
+
+      if (isMeal) {
+        if (!pendingTitle.isEmpty() && !pendingDishes.isEmpty()) {
+          pages.push_back({lastMealLetter, pendingTitle, pendingDishes});
+        }
+        pendingTitle = "";
+        pendingDishes = "";
+        lastMealLetter = currentMealLetter;
+      } else {
+        if (!pendingTitle.isEmpty() && !pendingDishes.isEmpty()) {
+          pages.push_back({lastMealLetter, pendingTitle, pendingDishes});
+        }
+        pendingTitle = heading;
+        pendingDishes = "";
+      }
+    } else if (line.startsWith("-")) {
+      String dish = line.substring(1);
+      dish.trim();
+      pendingDishes += dish + " • ";
+    }
+  }
+  f.close();
+
+// ✅ NEW CHECK:
+if (pages.empty()) {
+  pages.push_back({"", "Notice!", "No menu found! Check back later!"});
+}
+}
+
+void setPageForCurrentMeal() {
+  String mealLetter = getCurrentMealLetter();
+  for (size_t i = 0; i < pages.size(); i++) {
+    if (pages[i].mealLetter == mealLetter) {
+      currentPageIndex = i;
+      return;
+    }
+  }
+  currentPageIndex = 0;
+}
+
+void showCurrentPage() {
+  String hallName = String(halls[currentHallIndex].name);
+  hallName.replace("Bruin Plate", "Bplate");
+  hallName.replace("Epicuria", "Epic");
+  hallName.replace("Rendezvous", "Rende");
+
+  MenuPage &page = pages[currentPageIndex];
+  String dateStr = getCompactDate(selectedDayIndex);
+  String header = dateStr + " " + hallName;
+  if (page.mealLetter.length() > 0) {
+    header += " " + page.mealLetter;
+  }
+  header += " " + page.title;
+
+  headerScrollText = cleanText(header) + "   ";
+}
+
+void handleButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = now;
+  }
+
+  if ((now - lastDebounceTime) > DEBOUNCE_MS) {
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      if (buttonState == LOW) {
+        pressStartTime = now;
+        longPressDetected = false;
+      } else {
+        unsigned long pressDuration = now - pressStartTime;
+
+        if (!longPressDetected && pressDuration < LONGPRESS_MS) {
+          handleClick();
+        }
+      }
+    }
+  }
+
+  if (!longPressDetected && buttonState == LOW && (now - pressStartTime) >= LONGPRESS_MS) {
+    longPressAction();
+    longPressDetected = true;
+  }
+
+  lastButtonState = reading;
+
+  if (clickCount == 1 && millis() - lastClickTime > DOUBLECLICK_MS) {
+    shortPressAction();
+    clickCount = 0;
+  }
+}
+
+void showWeatherPage() {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println("Date: " + currentDate);
+  display.println("Time: " + currentTimeStr);
+  display.println(currentWeather);
+  display.display();
+}
+
+void scrollText() {
+  unsigned long now = millis();
+  if (now - lastScroll < SCROLL_SPEED_MS) return;
+  lastScroll = now;
+
+  // Update header scroll offset
+  if (now - headerLastScroll >= HEADER_SCROLL_SPEED_MS) {
+    headerScrollOffset++;
+    if (headerScrollOffset >= headerScrollText.length()) {
+      headerScrollOffset = 0;
+    }
+    headerLastScroll = now;
+  }
+
+  // Build header string to display
+  String headerToShow = "";
+  for (int i = 0; i < 21; i++) {
+    int idx = (headerScrollOffset + i) % headerScrollText.length();
+    headerToShow += headerScrollText[idx];
+  }
+
+  // Prepare bottom scrolling text
+  MenuPage &page = pages[currentPageIndex];
+  String baseText = cleanText(page.scrollingText);
+  String rope = baseText + "   ";
+  int textLen = rope.length();
+
+  int totalChars = 3 * 21;
+  String view = "";
+
+  for (int i = 0; i < totalChars; i++) {
+    int idx = (scrollOffset + i) % textLen;
+    view += rope[idx];
+    if ((i + 1) % 21 == 0 && i < totalChars - 1) {
+      view += "\n";
+    }
+  }
+
+  // Draw everything in one go
+  display.clearDisplay();
+
+  // Draw header
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println(headerToShow);
+
+  // Draw bottom text
+  display.setCursor(0, 8);
+  display.print(view);
+
+  display.display();
+
+  scrollOffset += 1;
+  if (scrollOffset >= textLen) scrollOffset = 0;
+}
+
+String getCurrentMealLetter() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "B";
+
+  int hour = timeinfo.tm_hour;
+  if (hour >= 24 || hour < 10) return "B";
+  if (hour < 15) return "L";
+  return "D";
+}
+
+void handleClick() {
+  unsigned long now = millis();
+
+  if (now - lastClickTime < DOUBLECLICK_MS) {
+    clickCount++;
+    if (clickCount == 2) {
+      doublePressAction();
+      clickCount = 0;
+    }
+  } else {
+    clickCount = 1;
+  }
+
+  lastClickTime = now;
+  lastInteractionTime = millis();
+}
+
+
+
+void longPressAction() {
+  if (currentMode == MODE_DATE_SELECT) {
+    currentMode = MODE_WEATHER;
+    if (!connectLocalWiFi(LOCAL_SSID, LOCAL_PASS, 30000)) {
+      scheduleDeepSleepUntilNightWake();
+      return;
+    }
+    fetchDateTime();
+    fetchWeather();
+    showWeatherPage();
+    return;
+  }
+
+  currentHallIndex++;
+  if (currentHallIndex >= NUM_HALLS) {
+    currentHallIndex = 0;
+  }
+  loadMenuPagesForCurrentHall();
+  setPageForCurrentMeal();
+  scrollOffset = 0;
+  headerScrollOffset = 0;
+  showCurrentPage();
+  lastInteractionTime = millis();
+}
+
+void shortPressAction() {
+  if (currentMode == MODE_DATE_SELECT) {
+    selectedDayIndex++;
+    if (selectedDayIndex >= 6) selectedDayIndex = 0;
+    if (selectedDayIndex < dateSelectScroll) dateSelectScroll = selectedDayIndex;
+    if (selectedDayIndex >= dateSelectScroll + 3) dateSelectScroll = selectedDayIndex - 2;
+    showDateSelectScreen();
+    return;
+  }
+
+  currentPageIndex++;
+  if (currentPageIndex >= pages.size()) {
+    currentPageIndex = 0;
+  }
+  scrollOffset = 0;
+  headerScrollOffset = 0;
+  showCurrentPage();
+  lastInteractionTime = millis();
+}
+
+void doublePressAction() {
+  if (currentMode == MODE_NORMAL) {
+    currentMode = MODE_DATE_SELECT;
+    selectedDayIndex = 0;
+    dateSelectScroll = 0;
+    showDateSelectScreen();
+  } else if (currentMode == MODE_DATE_SELECT) {
+    selectedDate = getDateString(selectedDayIndex);
+    loadMenuPagesForCurrentHall();
+    setPageForCurrentMeal();
+    showCurrentPage();
+    currentMode = MODE_NORMAL;
+  } else if (currentMode == MODE_WEATHER) {
+    currentMode = MODE_NORMAL;
+    showCurrentPage();
+  }
+}
+
+void showDateSelectScreen() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.println("Select Day:");
+
+  for (int i = dateSelectScroll; i < dateSelectScroll + 3 && i < 6; i++) {
+    String line = "";
+    if (i == selectedDayIndex) line += "> ";
+    else line += "  ";
+    line += getDayOfWeek(i) + " " + getCompactDate(i);
+    display.println(line);
+  }
+  display.display();
+}
